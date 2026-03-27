@@ -1,0 +1,17 @@
+# Python virtualenv
+backend-env/
+
+# macOS
+.DS_Store
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Node
+stock-strategy/node_modules/
+stock-strategy/dist/
+
+# Logs
+*.log

@@ -1,7 +1,8 @@
 import axios from "axios";
 import type { AnalysisResult, MarketOverview, StrategyConfig } from "./types";
 
-const BASE = "http://localhost:5001/api";
+// 生产环境通过 Nginx 反代 /api；开发时使用 Vite proxy 或直连后端
+const BASE = import.meta.env.VITE_API_BASE ?? "/api";
 
 export function buildParams(code: string, cfg: StrategyConfig): URLSearchParams {
   const p = new URLSearchParams();

@@ -1,7 +1,17 @@
 import React, { useState, useCallback, useEffect } from "react";
 import type { StrategyConfig, AnalysisResult } from "./types";
-import { fetchAnalysis, fetchPrices } from "./api";
-import { loadPortfolio, savePortfolio, updatePrices, calcRisk } from "./portfolio";
+import { fetchAnalysis } from "./api";
+import { calcRisk } from "./portfolio";
+import {
+  fetchSnapshot,
+  apiAddPosition,
+  apiDeletePosition,
+  apiSetCash,
+  apiSaveConfig,
+  apiRefreshPrices,
+  migrateFromLocalStorage,
+} from "./portfolioApi";
+import type { DBPosition } from "./portfolioApi";
 import { StrategyPanel } from "./components/StrategyPanel";
 import { ScoreGauge } from "./components/ScoreGauge";
 import { SignalList } from "./components/SignalList";
@@ -51,39 +61,75 @@ const EXAMPLE_STOCKS = [
 export default function App() {
   const [navTab, setNavTab] = useState<NavTab>("analyze");
   const [config, setConfig] = useState<StrategyConfig>(DEFAULT_CONFIG);
+  // 策略配置变化时自动持久化（portfolioLoading 期间跳过，避免覆盖 DB 数据）
+  const handleConfigChange = useCallback((cfg: StrategyConfig) => {
+    setConfig(cfg);
+    if (!portfolioLoading) apiSaveConfig(cfg).catch(() => {});
+  }, [portfolioLoading]);
   const [code, setCode] = useState("");
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState<AnalysisResult | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [chartTab, setChartTab] = useState<ChartTab>("kline");
 
-  // Portfolio state — persisted in localStorage
-  const [portfolio, setPortfolioState] = useState<Portfolio>(loadPortfolio);
+  // Portfolio state — persisted in SQLite via backend API
+  const [portfolio, setPortfolio] = useState<Portfolio>({ cash: 100000, positions: [], updatedAt: "" });
+  const [portfolioLoading, setPortfolioLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
 
-  const setPortfolio = useCallback((p: Portfolio) => {
-    setPortfolioState(p);
-    savePortfolio(p);
+  // DB Position 转 Portfolio Position（snake_case → camelCase）
+  const dbToPosition = (p: DBPosition) => ({
+    id: p.id,
+    code: p.code,
+    name: p.name,
+    shares: p.shares,
+    costPrice: p.cost_price,
+    currentPrice: p.current_price ?? undefined,
+    lastUpdated: p.last_updated ?? undefined,
+  });
+
+  // 拉取完整快照
+  const loadSnapshot = useCallback(async () => {
+    try {
+      const snap = await fetchSnapshot();
+      setPortfolio({
+        cash: snap.cash,
+        positions: snap.positions.map(dbToPosition),
+        updatedAt: snap.cash_updated_at,
+      });
+      setConfig(snap.config);
+    } catch {
+      // 后端暂不可达，保持当前状态
+    } finally {
+      setPortfolioLoading(false);
+    }
   }, []);
+
+  // 启动时：迁移旧 localStorage 数据，然后拉取快照
+  useEffect(() => {
+    migrateFromLocalStorage().then(() => loadSnapshot());
+  }, [loadSnapshot]);
 
   const metrics = calcRisk(portfolio, config.stop_loss_pct);
 
-  // Refresh prices from backend
+  // 刷新持仓现价（后端直接拉 AKShare 并写 DB）
   const handleRefreshPrices = useCallback(async () => {
     if (portfolio.positions.length === 0) return;
     setRefreshing(true);
     try {
-      const codes = portfolio.positions.map((p) => p.code);
-      const prices = await fetchPrices(codes);
-      setPortfolio(updatePrices(portfolio, prices));
+      const result = await apiRefreshPrices();
+      setPortfolio((prev) => ({
+        ...prev,
+        positions: result.positions.map(dbToPosition),
+      }));
     } catch {
-      // silently fail — prices stay at cost
+      // silently fail
     } finally {
       setRefreshing(false);
     }
-  }, [portfolio, setPortfolio]);
+  }, [portfolio.positions.length]);
 
-  // Auto-refresh prices when switching to portfolio/risk tab
+  // 切换到持仓/风险 tab 时自动刷新
   useEffect(() => {
     if ((navTab === "portfolio" || navTab === "risk") && portfolio.positions.length > 0) {
       handleRefreshPrices();
@@ -200,7 +246,7 @@ export default function App() {
 
             {/* Main layout */}
             <div className="grid grid-cols-1 xl:grid-cols-[320px_1fr] gap-4">
-              <StrategyPanel config={config} onChange={setConfig} />
+              <StrategyPanel config={config} onChange={handleConfigChange} />
 
               <div className="space-y-4">
                 {loading && (
@@ -356,10 +402,25 @@ export default function App() {
         {navTab === "portfolio" && (
           <PortfolioPanel
             portfolio={portfolio}
-            onChange={setPortfolio}
+            onAdd={async (params) => {
+              await apiAddPosition(params);
+              await loadSnapshot();
+            }}
+            onDelete={async (id) => {
+              await apiDeletePosition(id);
+              setPortfolio((prev) => ({
+                ...prev,
+                positions: prev.positions.filter((p) => p.id !== id),
+              }));
+            }}
+            onCashChange={async (amount) => {
+              await apiSetCash(amount);
+              setPortfolio((prev) => ({ ...prev, cash: amount }));
+            }}
             onRefreshPrices={handleRefreshPrices}
             refreshing={refreshing}
             stopLossPct={config.stop_loss_pct}
+            loading={portfolioLoading}
           />
         )}
 

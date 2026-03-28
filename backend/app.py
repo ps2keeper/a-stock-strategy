@@ -4,8 +4,13 @@ A股选股策略分析后端
 """
 
 import json
+import os
+import sqlite3
 import traceback
+import uuid
+from contextlib import contextmanager
 from datetime import datetime, timedelta
+from pathlib import Path
 
 import akshare as ak
 import numpy as np
@@ -15,6 +20,84 @@ from flask_cors import CORS
 
 app = Flask(__name__)
 CORS(app)
+
+# ─────────────────────────── SQLite 数据库 ───────────────────────────
+
+DB_PATH = Path(__file__).parent / "data" / "portfolio.db"
+DB_PATH.parent.mkdir(exist_ok=True)
+
+
+def get_conn() -> sqlite3.Connection:
+    conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    return conn
+
+
+@contextmanager
+def db():
+    conn = get_conn()
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def init_db():
+    with db() as conn:
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS positions (
+                id          TEXT PRIMARY KEY,
+                code        TEXT NOT NULL,
+                name        TEXT NOT NULL,
+                shares      REAL NOT NULL CHECK(shares > 0),
+                cost_price  REAL NOT NULL CHECK(cost_price > 0),
+                current_price REAL,
+                last_updated  TEXT,
+                created_at  TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+                updated_at  TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+            );
+
+            CREATE TABLE IF NOT EXISTS cash (
+                id      INTEGER PRIMARY KEY CHECK(id = 1),
+                amount  REAL NOT NULL DEFAULT 100000,
+                updated_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+            );
+
+            CREATE TABLE IF NOT EXISTS strategy_config (
+                id          INTEGER PRIMARY KEY CHECK(id = 1),
+                config_json TEXT NOT NULL,
+                updated_at  TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+            );
+
+            -- 确保 cash 表始终有一行
+            INSERT OR IGNORE INTO cash (id, amount) VALUES (1, 100000);
+
+            -- 确保 strategy_config 表始终有一行（默认均衡策略）
+            INSERT OR IGNORE INTO strategy_config (id, config_json) VALUES (1, '{
+                "enable_kline": true,
+                "enable_volume": true,
+                "enable_ma": true,
+                "enable_macd": true,
+                "enable_kdj": true,
+                "enable_rsi": true,
+                "enable_boll": true,
+                "vol_ratio_threshold": 1.5,
+                "kdj_oversold_threshold": 20,
+                "rsi_oversold_threshold": 30,
+                "rsi_breakout": 50,
+                "stop_loss_pct": 0.07,
+                "ma_relaxed": false
+            }');
+        """)
+
+
+init_db()
 
 # ── 股票列表缓存（启动后台线程预热，避免首次请求阻塞）──────────────
 import threading
@@ -665,6 +748,201 @@ def stock_list():
         if not _stock_list_loaded:
             return jsonify({"ready": False, "stocks": []})
         return jsonify({"ready": True, "stocks": _stock_list_cache})
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  持仓 CRUD
+# ═══════════════════════════════════════════════════════════════════
+
+@app.route("/api/portfolio/positions", methods=["GET"])
+def get_positions():
+    with db() as conn:
+        rows = conn.execute("SELECT * FROM positions ORDER BY created_at").fetchall()
+    return jsonify([dict(r) for r in rows])
+
+
+@app.route("/api/portfolio/positions", methods=["POST"])
+def add_position():
+    data = request.get_json()
+    code       = str(data.get("code", "")).strip()
+    name       = str(data.get("name", code)).strip()
+    shares     = float(data.get("shares", 0))
+    cost_price = float(data.get("costPrice", 0))
+
+    if not code or shares <= 0 or cost_price <= 0:
+        return jsonify({"error": "参数无效"}), 400
+
+    with db() as conn:
+        existing = conn.execute(
+            "SELECT id, shares, cost_price FROM positions WHERE code = ?", (code,)
+        ).fetchone()
+
+        if existing:
+            # 加权平均成本合并
+            total_shares = existing["shares"] + shares
+            avg_cost = (existing["shares"] * existing["cost_price"] + shares * cost_price) / total_shares
+            conn.execute(
+                """UPDATE positions
+                   SET shares=?, cost_price=?, name=?, updated_at=datetime('now','localtime')
+                   WHERE id=?""",
+                (total_shares, avg_cost, name, existing["id"])
+            )
+            row = conn.execute("SELECT * FROM positions WHERE id=?", (existing["id"],)).fetchone()
+        else:
+            pos_id = str(uuid.uuid4())
+            conn.execute(
+                """INSERT INTO positions (id, code, name, shares, cost_price)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (pos_id, code, name, shares, cost_price)
+            )
+            row = conn.execute("SELECT * FROM positions WHERE id=?", (pos_id,)).fetchone()
+
+    return jsonify(dict(row)), 201
+
+
+@app.route("/api/portfolio/positions/<pos_id>", methods=["PATCH"])
+def update_position(pos_id):
+    data = request.get_json()
+    with db() as conn:
+        row = conn.execute("SELECT * FROM positions WHERE id=?", (pos_id,)).fetchone()
+        if not row:
+            return jsonify({"error": "不存在"}), 404
+
+        fields, vals = [], []
+        for col, key in [("shares","shares"),("cost_price","costPrice"),
+                         ("current_price","currentPrice"),("name","name"),
+                         ("last_updated","lastUpdated")]:
+            if key in data:
+                fields.append(f"{col}=?")
+                vals.append(data[key])
+        if not fields:
+            return jsonify(dict(row))
+
+        fields.append("updated_at=datetime('now','localtime')")
+        vals.append(pos_id)
+        conn.execute(f"UPDATE positions SET {', '.join(fields)} WHERE id=?", vals)
+        row = conn.execute("SELECT * FROM positions WHERE id=?", (pos_id,)).fetchone()
+    return jsonify(dict(row))
+
+
+@app.route("/api/portfolio/positions/<pos_id>", methods=["DELETE"])
+def delete_position(pos_id):
+    with db() as conn:
+        conn.execute("DELETE FROM positions WHERE id=?", (pos_id,))
+    return jsonify({"ok": True})
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  现金
+# ═══════════════════════════════════════════════════════════════════
+
+@app.route("/api/portfolio/cash", methods=["GET"])
+def get_cash():
+    with db() as conn:
+        row = conn.execute("SELECT amount, updated_at FROM cash WHERE id=1").fetchone()
+    return jsonify(dict(row))
+
+
+@app.route("/api/portfolio/cash", methods=["PUT"])
+def set_cash():
+    data = request.get_json()
+    amount = float(data.get("amount", 0))
+    if amount < 0:
+        return jsonify({"error": "现金不能为负"}), 400
+    with db() as conn:
+        conn.execute(
+            "UPDATE cash SET amount=?, updated_at=datetime('now','localtime') WHERE id=1",
+            (amount,)
+        )
+        row = conn.execute("SELECT amount, updated_at FROM cash WHERE id=1").fetchone()
+    return jsonify(dict(row))
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  策略配置
+# ═══════════════════════════════════════════════════════════════════
+
+@app.route("/api/portfolio/config", methods=["GET"])
+def get_strategy_config():
+    with db() as conn:
+        row = conn.execute("SELECT config_json, updated_at FROM strategy_config WHERE id=1").fetchone()
+    return jsonify({"config": json.loads(row["config_json"]), "updated_at": row["updated_at"]})
+
+
+@app.route("/api/portfolio/config", methods=["PUT"])
+def set_strategy_config():
+    data = request.get_json()
+    cfg = data.get("config")
+    if not isinstance(cfg, dict):
+        return jsonify({"error": "config 必须是对象"}), 400
+    with db() as conn:
+        conn.execute(
+            "UPDATE strategy_config SET config_json=?, updated_at=datetime('now','localtime') WHERE id=1",
+            (json.dumps(cfg, ensure_ascii=False),)
+        )
+        row = conn.execute("SELECT config_json, updated_at FROM strategy_config WHERE id=1").fetchone()
+    return jsonify({"config": json.loads(row["config_json"]), "updated_at": row["updated_at"]})
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  批量更新持仓现价（行情刷新）
+# ═══════════════════════════════════════════════════════════════════
+
+@app.route("/api/portfolio/prices/refresh", methods=["POST"])
+def refresh_portfolio_prices():
+    """从 AKShare 批量拉取最新价并写入 DB"""
+    with db() as conn:
+        positions = conn.execute("SELECT id, code FROM positions").fetchall()
+
+    if not positions:
+        return jsonify({"updated": 0})
+
+    codes = [p["code"] for p in positions]
+    prices: dict = {}
+    end_date = datetime.now().strftime("%Y%m%d")
+    start_date = (datetime.now() - timedelta(days=10)).strftime("%Y%m%d")
+    for code in codes:
+        try:
+            df = ak.stock_zh_a_hist(
+                symbol=code, period="daily",
+                start_date=start_date, end_date=end_date, adjust="qfq"
+            )
+            if df is not None and len(df) > 0:
+                col = "收盘" if "收盘" in df.columns else "close"
+                prices[code] = round(float(df[col].iloc[-1]), 2)
+        except Exception:
+            pass
+
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with db() as conn:
+        for pos in positions:
+            if pos["code"] in prices:
+                conn.execute(
+                    "UPDATE positions SET current_price=?, last_updated=? WHERE id=?",
+                    (prices[pos["code"]], now, pos["id"])
+                )
+        updated_rows = conn.execute("SELECT * FROM positions").fetchall()
+
+    return jsonify({"updated": len(prices), "positions": [dict(r) for r in updated_rows]})
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  完整快照（一次拿全部数据，减少前端请求数）
+# ═══════════════════════════════════════════════════════════════════
+
+@app.route("/api/portfolio/snapshot", methods=["GET"])
+def portfolio_snapshot():
+    with db() as conn:
+        positions = [dict(r) for r in conn.execute("SELECT * FROM positions ORDER BY created_at").fetchall()]
+        cash_row  = dict(conn.execute("SELECT amount, updated_at FROM cash WHERE id=1").fetchone())
+        cfg_row   = conn.execute("SELECT config_json, updated_at FROM strategy_config WHERE id=1").fetchone()
+    return jsonify({
+        "positions": positions,
+        "cash": cash_row["amount"],
+        "cash_updated_at": cash_row["updated_at"],
+        "config": json.loads(cfg_row["config_json"]),
+        "config_updated_at": cfg_row["updated_at"],
+    })
 
 
 @app.route("/api/health", methods=["GET"])

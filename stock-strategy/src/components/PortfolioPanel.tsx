@@ -1,18 +1,16 @@
 import React, { useState } from "react";
 import type { Portfolio } from "../types";
-import {
-  addPosition,
-  removePosition,
-  updateCash,
-  calcPositions,
-} from "../portfolio";
+import { calcPositions } from "../portfolio";
 
 interface Props {
   portfolio: Portfolio;
-  onChange: (p: Portfolio) => void;
+  onAdd: (params: { code: string; name: string; shares: number; costPrice: number }) => Promise<void>;
+  onDelete: (id: string) => Promise<void>;
+  onCashChange: (amount: number) => Promise<void>;
   onRefreshPrices: () => void;
   refreshing: boolean;
   stopLossPct: number;
+  loading?: boolean;
 }
 
 const fmt = (n: number) =>
@@ -20,48 +18,76 @@ const fmt = (n: number) =>
 
 export const PortfolioPanel: React.FC<Props> = ({
   portfolio,
-  onChange,
+  onAdd,
+  onDelete,
+  onCashChange,
   onRefreshPrices,
   refreshing,
   stopLossPct,
+  loading,
 }) => {
   const [form, setForm] = useState({ code: "", name: "", shares: "", costPrice: "" });
   const [formError, setFormError] = useState("");
+  const [saving, setSaving] = useState(false);
   const [editingCash, setEditingCash] = useState(false);
   const [cashInput, setCashInput] = useState(String(portfolio.cash));
+  const [deletingId, setDeletingId] = useState<string | null>(null);
 
   const stockValue = portfolio.positions.reduce((s, p) => {
     const price = p.currentPrice ?? p.costPrice;
     return s + p.shares * price;
   }, 0);
   const totalAssets = stockValue + portfolio.cash;
-
   const posCalc = calcPositions(portfolio.positions, totalAssets, stopLossPct);
 
-  const handleAdd = () => {
+  const handleAdd = async () => {
     const shares = Number(form.shares);
     const costPrice = Number(form.costPrice);
     if (!form.code.trim()) return setFormError("请输入股票代码");
     if (!shares || shares <= 0) return setFormError("请输入有效股数");
     if (!costPrice || costPrice <= 0) return setFormError("请输入有效成本价");
     setFormError("");
-    const updated = addPosition(portfolio, {
-      code: form.code.trim(),
-      name: form.name.trim() || form.code.trim(),
-      shares,
-      costPrice,
-    });
-    onChange(updated);
-    setForm({ code: "", name: "", shares: "", costPrice: "" });
+    setSaving(true);
+    try {
+      await onAdd({
+        code: form.code.trim(),
+        name: form.name.trim() || form.code.trim(),
+        shares,
+        costPrice,
+      });
+      setForm({ code: "", name: "", shares: "", costPrice: "" });
+    } catch {
+      setFormError("添加失败，请重试");
+    } finally {
+      setSaving(false);
+    }
   };
 
-  const handleRemove = (id: string) => onChange(removePosition(portfolio, id));
+  const handleRemove = async (id: string) => {
+    setDeletingId(id);
+    try {
+      await onDelete(id);
+    } finally {
+      setDeletingId(null);
+    }
+  };
 
-  const handleCashSave = () => {
+  const handleCashSave = async () => {
     const v = Number(cashInput);
-    if (!isNaN(v) && v >= 0) onChange(updateCash(portfolio, v));
+    if (!isNaN(v) && v >= 0) {
+      await onCashChange(v);
+    }
     setEditingCash(false);
   };
+
+  if (loading) {
+    return (
+      <div className="card p-16 flex flex-col items-center gap-4">
+        <div className="w-8 h-8 border-2 border-blue-500 border-t-transparent rounded-full animate-spin" />
+        <p className="text-sm text-[#475569]">加载持仓数据...</p>
+      </div>
+    );
+  }
 
   return (
     <div className="space-y-4">
@@ -97,7 +123,7 @@ export const PortfolioPanel: React.FC<Props> = ({
               ¥{fmt(portfolio.cash)}
             </button>
           )}
-          <p className="text-xs text-[#475569] mt-0.5">点击编辑</p>
+          <p className="text-xs text-[#475569] mt-0.5">点击编辑 · 已存入数据库</p>
         </div>
       </div>
 
@@ -105,53 +131,30 @@ export const PortfolioPanel: React.FC<Props> = ({
       <div className="card p-4">
         <p className="text-xs tracking-widest text-[#64748b] uppercase mb-3">添加持仓</p>
         <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 mb-2">
-          <input
-            type="text"
-            placeholder="股票代码 *"
-            value={form.code}
+          <input type="text" placeholder="股票代码 *" value={form.code}
             onChange={(e) => setForm({ ...form, code: e.target.value })}
-            className="px-3 py-2 rounded-lg text-xs"
-          />
-          <input
-            type="text"
-            placeholder="股票名称"
-            value={form.name}
+            className="px-3 py-2 rounded-lg text-xs" />
+          <input type="text" placeholder="股票名称" value={form.name}
             onChange={(e) => setForm({ ...form, name: e.target.value })}
-            className="px-3 py-2 rounded-lg text-xs"
-          />
-          <input
-            type="number"
-            placeholder="持股数量（股）*"
-            value={form.shares}
+            className="px-3 py-2 rounded-lg text-xs" />
+          <input type="number" placeholder="持股数量（股）*" value={form.shares}
             onChange={(e) => setForm({ ...form, shares: e.target.value })}
-            className="px-3 py-2 rounded-lg text-xs"
-            min={1}
-          />
-          <input
-            type="number"
-            placeholder="成本价（元）*"
-            value={form.costPrice}
+            className="px-3 py-2 rounded-lg text-xs" min={1} />
+          <input type="number" placeholder="成本价（元）*" value={form.costPrice}
             onChange={(e) => setForm({ ...form, costPrice: e.target.value })}
-            className="px-3 py-2 rounded-lg text-xs"
-            step={0.01}
-            min={0.01}
-          />
+            className="px-3 py-2 rounded-lg text-xs" step={0.01} min={0.01} />
         </div>
         {formError && <p className="text-red-400 text-xs mb-2">{formError}</p>}
-        <div className="flex gap-2">
-          <button
-            onClick={handleAdd}
-            className="px-4 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-500 text-xs font-medium transition-colors"
-          >
-            添加 / 合并
+        <div className="flex gap-2 items-center">
+          <button onClick={handleAdd} disabled={saving}
+            className="px-4 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-xs font-medium transition-colors">
+            {saving ? "保存中..." : "添加 / 合并"}
           </button>
-          <button
-            onClick={onRefreshPrices}
-            disabled={refreshing || portfolio.positions.length === 0}
-            className="px-4 py-1.5 rounded-lg border border-[#1e2d45] text-xs text-[#64748b] hover:text-[#94a3b8] disabled:opacity-40 transition-colors"
-          >
+          <button onClick={onRefreshPrices} disabled={refreshing || portfolio.positions.length === 0}
+            className="px-4 py-1.5 rounded-lg border border-[#1e2d45] text-xs text-[#64748b] hover:text-[#94a3b8] disabled:opacity-40 transition-colors">
             {refreshing ? "更新中..." : "刷新行情"}
           </button>
+          <span className="text-[10px] text-[#334155] ml-auto">数据存储于 SQLite</span>
         </div>
       </div>
 
@@ -166,21 +169,15 @@ export const PortfolioPanel: React.FC<Props> = ({
             <table className="w-full text-xs">
               <thead>
                 <tr className="border-b border-[#1e2d45] text-[#475569]">
-                  {["代码/名称", "持股数", "成本价", "现价", "市值", "浮盈亏", "占比", "止损价", ""].map((h) => (
-                    <th key={h} className="px-3 py-2.5 text-left font-medium whitespace-nowrap">
-                      {h}
-                    </th>
+                  {["代码/名称","持股数","成本价","现价","市值","浮盈亏","占比","止损价",""].map((h) => (
+                    <th key={h} className="px-3 py-2.5 text-left font-medium whitespace-nowrap">{h}</th>
                   ))}
                 </tr>
               </thead>
               <tbody>
                 {posCalc.map((pos) => (
-                  <tr
-                    key={pos.id}
-                    className={`border-b border-[#1e2d45]/50 hover:bg-[#141d2e] transition-colors ${
-                      pos.stopLossTriggered ? "bg-red-950/20" : ""
-                    }`}
-                  >
+                  <tr key={pos.id}
+                    className={`border-b border-[#1e2d45]/50 hover:bg-[#141d2e] transition-colors ${pos.stopLossTriggered ? "bg-red-950/20" : ""}`}>
                     <td className="px-3 py-2.5">
                       <div className="font-medium text-[#e2e8f0]">{pos.name}</div>
                       <div className="text-[#475569]">{pos.code}</div>
@@ -192,13 +189,9 @@ export const PortfolioPanel: React.FC<Props> = ({
                         <span className={pos.currentPrice >= pos.costPrice ? "text-red-400" : "text-green-400"}>
                           ¥{pos.currentPrice.toFixed(2)}
                         </span>
-                      ) : (
-                        <span className="text-[#475569]">—</span>
-                      )}
+                      ) : <span className="text-[#475569]">—</span>}
                     </td>
-                    <td className="px-3 py-2.5 text-amber-400 font-medium">
-                      ¥{fmt(pos.marketValue)}
-                    </td>
+                    <td className="px-3 py-2.5 text-amber-400 font-medium">¥{fmt(pos.marketValue)}</td>
                     <td className="px-3 py-2.5">
                       <div className={pos.pnl >= 0 ? "text-red-400" : "text-green-400"}>
                         {pos.pnl >= 0 ? "+" : ""}¥{fmt(pos.pnl)}
@@ -209,10 +202,8 @@ export const PortfolioPanel: React.FC<Props> = ({
                     </td>
                     <td className="px-3 py-2.5">
                       <div className="flex items-center gap-1">
-                        <div
-                          className="h-1 rounded-full bg-blue-500/40"
-                          style={{ width: `${Math.min(pos.weight, 100) * 0.6}px` }}
-                        />
+                        <div className="h-1 rounded-full bg-blue-500/40"
+                          style={{ width: `${Math.min(pos.weight, 100) * 0.6}px` }} />
                         <span className="text-[#94a3b8]">{pos.weight.toFixed(1)}%</span>
                       </div>
                     </td>
@@ -226,12 +217,11 @@ export const PortfolioPanel: React.FC<Props> = ({
                       )}
                     </td>
                     <td className="px-3 py-2.5">
-                      <button
-                        onClick={() => handleRemove(pos.id)}
-                        className="text-[#475569] hover:text-red-400 transition-colors text-xs"
-                        title="删除"
-                      >
-                        ✕
+                      <button onClick={() => handleRemove(pos.id)}
+                        disabled={deletingId === pos.id}
+                        className="text-[#475569] hover:text-red-400 transition-colors text-xs disabled:opacity-40"
+                        title="删除">
+                        {deletingId === pos.id ? "..." : "✕"}
                       </button>
                     </td>
                   </tr>
@@ -260,9 +250,7 @@ export const PortfolioPanel: React.FC<Props> = ({
   );
 };
 
-const AssetCard: React.FC<{ label: string; value: number; color: string }> = ({
-  label, value, color,
-}) => (
+const AssetCard: React.FC<{ label: string; value: number; color: string }> = ({ label, value, color }) => (
   <div className="text-center">
     <p className="text-xs text-[#475569] mb-1">{label}</p>
     <p className={`text-lg font-bold ${color}`}>¥{fmt(value)}</p>

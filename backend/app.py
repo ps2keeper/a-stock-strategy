@@ -16,6 +16,30 @@ from flask_cors import CORS
 app = Flask(__name__)
 CORS(app)
 
+# ── 股票列表缓存（启动后台线程预热，避免首次请求阻塞）──────────────
+import threading
+
+_stock_list_cache: list = []
+_stock_list_lock = threading.Lock()
+_stock_list_loaded = False
+
+
+def _load_stock_list():
+    global _stock_list_cache, _stock_list_loaded
+    try:
+        df = ak.stock_info_a_code_name()
+        with _stock_list_lock:
+            _stock_list_cache = [
+                {"code": row["code"], "name": row["name"].strip()}
+                for _, row in df.iterrows()
+            ]
+            _stock_list_loaded = True
+    except Exception as e:
+        print(f"[stock list] 加载失败: {e}")
+
+
+threading.Thread(target=_load_stock_list, daemon=True).start()
+
 
 # ─────────────────────────── 指标计算 ────────────────────────────
 
@@ -632,6 +656,15 @@ def get_prices():
             pass
 
     return jsonify({"prices": prices})
+
+
+@app.route("/api/stock/list", methods=["GET"])
+def stock_list():
+    """返回全量A股列表（code + name），供前端拼音/汉字/代码搜索"""
+    with _stock_list_lock:
+        if not _stock_list_loaded:
+            return jsonify({"ready": False, "stocks": []})
+        return jsonify({"ready": True, "stocks": _stock_list_cache})
 
 
 @app.route("/api/health", methods=["GET"])

@@ -9,6 +9,7 @@ import { StockChart } from "./components/StockChart";
 import { MarketBar } from "./components/MarketBar";
 import { PortfolioPanel } from "./components/PortfolioPanel";
 import { RiskDashboard } from "./components/RiskDashboard";
+import { StockSearch } from "./components/StockSearch";
 import type { Portfolio } from "./types";
 
 const DEFAULT_CONFIG: StrategyConfig = {
@@ -91,7 +92,7 @@ export default function App() {
   }, [navTab]);
 
   const analyze = useCallback(
-    async (targetCode?: string) => {
+    async (targetCode?: string, _name?: string) => {
       const c = (targetCode ?? code).trim();
       if (!c) return;
       setLoading(true);
@@ -111,10 +112,6 @@ export default function App() {
     },
     [code, config]
   );
-
-  const handleKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === "Enter") analyze();
-  };
 
   const colorMap: Record<string, string> = {
     green: "border-green-500/40 glow-green",
@@ -180,28 +177,18 @@ export default function App() {
             {/* Search bar */}
             <div className="card p-4">
               <div className="flex items-center gap-3 flex-wrap">
-                <div className="flex-1 min-w-48">
-                  <input
-                    type="text"
-                    value={code}
-                    onChange={(e) => setCode(e.target.value)}
-                    onKeyDown={handleKeyDown}
-                    placeholder="输入股票代码（如 000001）"
-                    className="w-full px-4 py-2.5 rounded-lg text-sm"
-                  />
-                </div>
-                <button
-                  onClick={() => analyze()}
-                  disabled={loading || !code.trim()}
-                  className="px-6 py-2.5 rounded-lg bg-blue-600 hover:bg-blue-500 disabled:opacity-50 disabled:cursor-not-allowed text-sm font-medium transition-colors"
-                >
-                  {loading ? "分析中..." : "开始分析"}
-                </button>
+                <StockSearch
+                  loading={loading}
+                  onSelect={(selectedCode, selectedName) => {
+                    setCode(selectedCode);
+                    analyze(selectedCode, selectedName);
+                  }}
+                />
                 <div className="flex gap-2 flex-wrap">
                   {EXAMPLE_STOCKS.map((s) => (
                     <button
                       key={s.code}
-                      onClick={() => { setCode(s.code); analyze(s.code); }}
+                      onClick={() => { setCode(s.code); analyze(s.code, s.name); }}
                       className="text-xs px-2.5 py-1 rounded border border-[#1e2d45] text-[#64748b] hover:text-[#94a3b8] hover:border-[#2d4060] transition-colors"
                     >
                       {s.name}
